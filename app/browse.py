@@ -123,6 +123,7 @@ def search(db: Session, doc: Document, version: DocumentVersion | None, q: str, 
         i = n.body_text.lower().find(ql)
         snippet = n.body_text[max(0, i - 60): i + len(q) + 60] if i >= 0 else n.body_text[:120]
         d = summary(n)
+        d["child_count"] = None  # not computed for search hits; fetch the node for children
         d.update({"version": n.version.version_number, "matched_in": matched, "snippet": snippet})
         hits.append(d)
     return hits

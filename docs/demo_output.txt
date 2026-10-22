@@ -1,0 +1,153 @@
+
+==============================================================================
+1. Ingest v1 (data/ct200_manual.pdf)
+==============================================================================
+{
+  "version_number": 1,
+  "source_filename": "ct200_manual.pdf",
+  "page_count": 6,
+  "title": "CardioTrack CT-200 Home Blood Pressure Monitor — Technical & User Manual"
+}
+
+==============================================================================
+2. Top-level sections of the latest version, and node 2.1 (skipped level 2.1.1)
+==============================================================================
+  ct200:v1:1           1 Device Overview  (2 children)
+  ct200:v1:2           2 Physical and Electrical Specifications  (2 children)
+  ct200:v1:3           3 Device Operation  (4 children)
+  ct200:v1:4           4 Alarms and Safety Behavior  (3 children)
+  ct200:v1:5           5 Data Management  (2 children)
+  ct200:v1:6           6 Maintenance and Cleaning  (2 children)
+  ct200:v1:7           7 Troubleshooting  (2 children)
+  ct200:v1:8           8 Regulatory Information  (1 children)
+{
+  "id": "ct200:v1:2.1.1.1",
+  "heading": "Battery Life Under Typical Use",
+  "level": 4,
+  "parent_id": "ct200:v1:2.1",
+  "breadcrumb": [
+    "2 Physical and Electrical Specifications",
+    "2.1 General Specifications"
+  ],
+  "content_hash": "ae99d3c8a9c8acbc9e2388664fab52a0aab5369d6f428b268ec0e718f592662b",
+  "anomalies": [
+    {
+      "type": "skipped_level",
+      "detail": "expected parent 2.1.1 does not exist; attached to nearest ancestor 2.1"
+    }
+  ]
+}
+
+==============================================================================
+3. Search headings for 'Error Codes' (duplicate heading -> two distinct nodes)
+==============================================================================
+  ct200:v1:4.2  parent section 4
+  ct200:v1:7.1  parent section 7
+
+==============================================================================
+4. Create a selection pinned to v1: 3.2 inflation, 4.2 error codes, 6.1 cleaning
+==============================================================================
+  selection id: 6dafaf9c-beca-463c-aa08-4d7ca549a22a  versions: [1]
+
+==============================================================================
+5. Generate test cases
+==============================================================================
+  generation 493985c4-7a7d-45ea-8e2f-4da79d4ca8da status=succeeded model=mock/mock-1 attempts=1 staleness=current
+  TC-1 [high] Verify nominal behaviour: On starting a measurement, the device inflates the cuff to a
+      quote: 'On starting a measurement, the device inflates the cuff to an initial target of 180 mmHg.'
+      from: ['ct200:v1:3.2']
+  TC-2 [high] Verify boundary condition: If the user's pulse is not detected by 180 mmHg, the device
+      quote: "If the user's pulse is not detected by 180 mmHg, the device inflates in 40 mmHg increments up to a maximum of 299 mmHg before aborting with an error."
+      from: ['ct200:v1:3.2']
+  TC-3 [medium] Verify behaviour outside the specified condition: Deflation occurs in controlled steps of approximately 3 mmHg
+      quote: 'Deflation occurs in controlled steps of approximately 3 mmHg to capture oscillometric pulse data.'
+      from: ['ct200:v1:3.2']
+  TC-4 [high] Verify nominal behaviour: E1 | Cuff not connected or leak detected | Aborts measuremen
+      quote: 'E1 | Cuff not connected or leak detected | Aborts measurement, displays E1'
+      from: ['ct200:v1:4.2']
+
+==============================================================================
+6. Submit the same selection again (policy: reuse, no second LLM call)
+==============================================================================
+  reused=True same id=True
+
+==============================================================================
+7. Ingest v2 (data/ct200_manual_v2.pdf) - v1 is kept
+==============================================================================
+{
+  "added": [
+    "ct200:v2:5.3"
+  ],
+  "modified": [
+    "ct200:v2:2.1.1.1",
+    "ct200:v2:3.2",
+    "ct200:v2:4.2",
+    "ct200:v2:4.3"
+  ],
+  "removed": [],
+  "renumbered": []
+}
+  unchanged: 23 nodes
+
+==============================================================================
+8. The old selection still resolves to the exact v1 text
+==============================================================================
+  ct200:v1:3.2     pin_intact=True  latest: changed / substantive
+  ct200:v1:4.2     pin_intact=True  latest: changed / substantive
+  ct200:v1:6.1     pin_intact=True  latest: unchanged / none
+  3.2 pinned text: On starting a measurement, the device inflates the cuff to an initial target of 180 mmHg. If the user's pulse is not detected by 180 mmHg, t
+
+==============================================================================
+9. Retrieve the generation: staleness is computed against v2
+==============================================================================
+  overall: stale (generated from v[1], checked against v2)
+  source ct200:v1:3.2     changed   substantive replaced=[('40', '30')] added=['30 mmHg']
+  source ct200:v1:4.2     changed   substantive replaced=[('2', '1.5')] added=['1.5 seconds', 'E6', 'E6']
+  source ct200:v1:6.1     unchanged none
+  TC-1: review       cited section changed substantively, quoted requirement still present
+  TC-2: stale        the quoted requirement no longer appears in the current text
+  TC-3: review       cited section changed substantively, quoted requirement still present
+  TC-4: review       cited section changed substantively, quoted requirement still present
+  new sections since generation (coverage gap, not staleness): ['ct200:v2:5.3']
+
+==============================================================================
+10. Look up generations by the v2 id of section 3.2 (same logical node)
+==============================================================================
+  found ['493985c4-7a7d-45ea-8e2f-4da79d4ca8da'] -> staleness ['stale']
+
+==============================================================================
+11. Change report for node 3.2
+==============================================================================
+{
+  "changed_across_versions": true,
+  "severity": "substantive",
+  "numeric_changes": {
+    "replaced": [
+      {
+        "old": "40",
+        "new": "30",
+        "context_before": "the device inflates in"
+      }
+    ],
+    "removed": [],
+    "added": [
+      "30 mmHg"
+    ]
+  },
+  "changes": [
+    {
+      "op": "replace",
+      "old": "40",
+      "new": "30",
+      "context_before": "the device inflates in"
+    },
+    {
+      "op": "insert",
+      "old": "",
+      "new": "Increment size was reduced from the original 40 mmHg to improve pulse - detection reliability in field testing .",
+      "context_before": "oscillometric pulse data ."
+    }
+  ]
+}
+
+Demo finished.

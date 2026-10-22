@@ -30,7 +30,7 @@ class NodeSummary(BaseModel):
     page: int
     content_hash: str
     change_status: str
-    child_count: int = 0
+    child_count: int | None = 0
     anomalies: list[dict] = []
 
 
