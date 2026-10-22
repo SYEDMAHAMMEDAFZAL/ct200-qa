@@ -1,278 +1,235 @@
-# Approach: CT-200 QA traceability API
+# Approach Document: CT-200 QA Traceability API
 
-## 1. Overview
+S. Md. Afzal · Tri9T AI Engineering Internship Assignment
+Repo: https://github.com/SYEDMAHAMMEDAFZAL/ct200-qa
 
-```
-PDF ──parse──▶ sections (number, heading, level, blocks, hash, anomalies)
-                 │
-                 ▼  match against previous version
-SQLite: documents ─ versions ─ nodes ─▶ logical_nodes      selections ─ selection_items ─▶ nodes (pinned)
-                                                                  │
-                                                                  ▼  prompt + validate + retry
-                                         TinyDB: generations { sources snapshot, test_cases, attempts }
-                                                                  │
-                                                                  ▼  on every read
-                                                      staleness vs latest version
-```
+## 1. What I built
+
+A FastAPI backend that:
+
+1. reads the CT-200 manual PDF and turns it into a tree of sections,
+2. stores each new version of the manual next to the old ones,
+3. lets you browse, search and compare sections,
+4. saves a "selection" of sections pinned to one version,
+5. asks an LLM for 3 to 5 QA test cases for a selection and checks the answer,
+6. tells you later whether those test cases are still valid after the manual changes.
+
+Stack: FastAPI, Pydantic, SQLAlchemy with SQLite, TinyDB for the LLM output, PyMuPDF for the PDF,
+Tesseract for OCR, and Groq (Llama 3.3) as the LLM. There is also a mock LLM so everything runs offline.
 
 ## 2. Data model
 
-| Table / store | What it holds | Why |
-|---|---|---|
-| `documents` | slug, title | one row per manual |
-| `document_versions` | number, file sha256, parse warnings, change summary | v2 is added next to v1, never over it |
-| `nodes` | one section *as it exists in one version*: id `ct200:v1:4.2`, parent, number, heading, level, order, page, body text, typed blocks (paragraph / list item / table rows), `content_hash`, anomalies, cross-references, `change_status`, `match_method`, `prev_node_id` | immutable once written, so anything pinned to it stays valid |
-| `logical_nodes` | identity of "the same section" across versions | unchanged v2 nodes point to the same logical node as v1, so they are recognised as the same section and not duplicated |
-| `selections`, `selection_items` | name + list of **node ids** (which are version-specific) + hash at pin time | version pinning comes from the ids themselves; `pin_intact` re-checks the hash on read |
-| TinyDB `generations` | selection id, cache key, prompt version, model, **snapshot of every source** (node id, logical id, version, hash, text), test cases, every raw attempt with its errors | survives re-versioning on its own: even if SQL rows changed, the generation knows exactly what text it came from |
+- **documents**: one row per manual.
+- **document_versions**: v1, v2 and so on. A new upload adds a version and never overwrites the old one.
+  Uploading the exact same file again does nothing.
+- **nodes**: one section in one version. The id is readable, for example `ct200:v1:4.2`. Each node
+  stores the heading, level, parent, body text, blocks (paragraphs, list items, table rows), a content
+  hash and any problems the parser noticed. Nodes are never edited after they are saved.
+- **logical_nodes**: links "the same section" across versions. If 3.1 did not change in v2, both
+  versions point to the same logical node, so it is not counted as a new section.
+- **selections**: a name and a list of node ids. A node id already includes the version, so a selection
+  always points to the exact text it was made from, even after v2 is loaded.
+- **generations (TinyDB)**: the test cases, plus a copy of the source text they were made from, plus
+  every raw LLM answer and its errors.
 
-`content_hash` is SHA-256 of the body text with all whitespace collapsed. v2 moves section 3.1 to a
-different page and wraps its lines differently; a raw-text hash would call that a change.
+The content hash is SHA-256 of the body text with all whitespace squeezed to single spaces. I did this
+because in v2, section 3.1 moves to another page and its lines wrap differently even though the words
+are the same. Hashing the raw text would have reported a false change.
 
-**Stack deviation: TinyDB instead of MongoDB.** Generations are documents (nested cases, raw attempts,
-source snapshots), so a document store fits, but a reviewer should not need to run a Mongo server to try
-this. TinyDB is a JSON file with queries. It sits behind a four-method `GenerationStore` interface, so a
-Mongo class is a drop-in. What it costs: TinyDB is single-process (I added a lock because FastAPI runs
-sync routes in a thread pool) and it rewrites the whole file on each insert. Fine for this, not for
-production.
+**Why TinyDB and not MongoDB:** the LLM output is naturally a JSON document, but I did not want
+reviewers to have to install and run a Mongo server just to try the project. TinyDB is a single JSON
+file. All access goes through a small `GenerationStore` class, so swapping in Mongo later means
+writing one new class. The downside is that TinyDB only works for one process and rewrites the whole
+file on every insert.
 
 ## 3. Parsing the PDF
 
-### Approach and why
+### How I approached it
 
-I inspected the PDF before writing any logic (`scripts/dump_spans.py` prints every span with font,
-size, flags and position; `pdffonts` shows embedded Nimbus Sans fonts; `pdfimages` shows no images). The
-PDF has a real text layer, so **the primary path reads text spans with PyMuPDF**, keeping font
-weight, size and position. OCR is less accurate than text the PDF already carries, and it loses the
-bold/size cues that tell headings apart. **Tesseract OCR is still in the pipeline in two places:**
+Before writing any parser code I dumped every piece of text in the PDF with its font, size and position
+(`scripts/dump_spans.py`). That showed me the PDF has real text inside it, not scanned images. So I read
+the text directly with PyMuPDF. That is more accurate than OCR, and it keeps the bold and size
+information I need to find headings.
 
-1. **Fallback:** a page with fewer than 20 characters of text layer is OCR'd at 300 dpi. That page gets
-   an `ocr_page` warning because bold/size cues are not available there. If OCR fails, the page gets
-   `unreadable_page`. It is never silently skipped.
-2. **Validation:** `ocr_crosscheck` renders each page, OCRs it and reports words that OCR sees but the
-   text layer does not (text inside images, or spans my extraction dropped). On both CT-200 PDFs,
-   coverage is 100% on every page except page 5 (99.1%), where the only "missing" word is `storageis`, an
-   OCR merge of "storage is". `OCR_CROSSCHECK=1` runs it at ingest and records `ocr_mismatch` warnings.
+I still use OCR (Tesseract) in two places:
+- **fallback**: if a page has almost no text, it gets OCR'd and marked with a warning.
+- **check**: `scripts/ocr_check.py` OCRs every page and lists words that OCR can see but my text
+  extraction missed. On both PDFs it found nothing missing (one page shows 99%, and the only
+  difference is OCR joining "storage is" into "storageis").
 
-Tables use PyMuPDF `find_tables()` for the **cell geometry only** (see 3.4). Lines inside a table's
-bounding box are removed from the paragraph stream, so table text does not appear twice.
+### How I build the tree
 
-### Hierarchy reconstruction
+- A heading is a **bold line that starts with a section number** such as `3.2` or `2.1.1.1`.
+- The level comes from the **number** (`2.1.1.1` is level 4), not the font size.
+- The parent is the closest number above it that actually exists.
+- Normal text is split into paragraphs, list items and tables.
+- Tables are found with PyMuPDF, and their text is taken out of the normal paragraphs.
 
-* A **heading** is a bold line matching `^\d+(\.\d+)*\.?\s+text`. The **level is the numbering depth**,
-  not the font size.
-* The **parent** is the longest numeric prefix that exists anywhere in the document, found in a second
-  pass, so order on the page does not matter.
-* The title is the large bold text on page 1 before the first heading (three lines joined).
-* The body is split into typed blocks. A new paragraph starts on a vertical gap larger than 1.6 line
-  heights. Indented `1.` / `•` lines become list items, and their indented continuation lines are merged
-  into them. Tables become `table` blocks with rows. A page break does not end a paragraph by itself.
-* Cross-references in body text ("see 2.1, 4.3", "Section 4.2") are extracted as `references` and
-  checked against existing sections. They are never treated as headings.
+### Problems in this PDF and what I did with each
 
-### Irregularities found and how each is handled
+1. **Two sections called "Error Codes"** (4.2 and 7.1). Ids come from section numbers, not titles,
+   so they are two separate nodes under 4 and 7.
+2. **2.1.1.1 exists but 2.1.1 does not.** I attach it to 2.1, keep its level as 4, and add a
+   `skipped_level` warning. I do not make up an empty 2.1.1.
+3. **3.4 comes before 3.3.** I keep the order they appear in, parent both under 3, and flag both
+   as `out_of_order`.
+4. **3.2 and 2.1.1.1 use the same font size as body text** (11pt bold, while other headings are
+   12.9pt). This is why I use the number for the level, not the font size.
+5. **The numbered list in 3.3** ("1. Normal ...") looks like headings. These lines are not bold and
+   are indented, so they become list items. The wrapped second line of item 5 is joined back onto it.
+6. **Tables** in 2.1 and 4.2 with cells that wrap over two lines. They are stored as table rows.
+7. **Section 3.1 continues onto the next page.** A page break alone does not start a new paragraph,
+   so the text stays together in 3.1.
+8. **Special characters**: "fi" and "ff" ligatures, and a special non-breaking hyphen in a different
+   font. I normalise these so "CT-200" is always spelled the same way.
+9. **References like "see 2.1, 4.3"** inside text. These are saved as references, not treated as headings.
 
-| # | What is in the PDF | What a naive parser does | What this parser does | Test |
-|---|---|---|---|---|
-| 1 | **"Error Codes" is the heading of both 4.2 and 7.1** | title-keyed nodes merge or overwrite | ids come from section numbers, so two nodes with parents 4 and 7; both flagged `duplicate_heading` | `test_duplicate_heading_gives_two_nodes_with_correct_parents` |
-| 2 | **2.1.1.1 exists, 2.1.1 does not** | either invents an empty 2.1.1 or attaches it to whatever came last | attached to the nearest real ancestor 2.1, keeps level 4, flagged `skipped_level`; no synthetic node | `test_skipped_level_...` |
-| 3 | **3.4 comes before 3.3** | sorts them (hiding that the document is out of order) or parents 3.3 under 3.4 | parented by number, document order kept, both flagged `out_of_order` | `test_out_of_order_siblings_...` |
-| 4 | **3.2 and 2.1.1.1 are 11pt bold, the same size as body text**, while siblings are 12.9pt | size-based levels make 3.2 a child of 3.1, or body text | level from numbering; boldness plus a number is what makes a heading | `test_body_size_bold_heading_is_still_a_heading` |
-| 5 | **Numbered list in 3.3** ("1. Normal: ...") looks like headings "1." to "5." | creates sections 1 to 5 again, or re-parents everything after | regular weight and indented, so list items; the wrapped line of item 5 is merged in | `test_numbered_list_is_not_parsed_as_headings` |
-| 6 | **Tables** in 2.1 and 4.2 (multi-line cells) | interleaves cells into paragraphs | `table` blocks with rows; cells rebuilt from text lines | `test_tables_are_extracted_with_correct_cells` |
-| 7 | **3.1 starts at the bottom of page 2 and continues on page 3** | the page-3 part becomes orphan text or joins 3.2 | a page break alone does not end a paragraph; it stays in 3.1 | `test_paragraph_split_across_page_break_...` |
-| 8 | **Ligatures** (ﬁ, ﬀ) and **U+2011 non-breaking hyphens** in a fallback serif font | "CT‑200" ≠ "CT-200", search misses, hashes differ by font choice | NFKC + hyphen mapping before anything else | `test_ligatures_and_nonbreaking_hyphens_...` |
-| 9 | **Spacing between headings is inconsistent** (2→2.1 has none, 3→3.1 has a large gap; v2 changes the 4→4.1 gap) | gap-based heading detection breaks | gaps only separate paragraphs, never decide structure | covered by the full-section test |
-| 10 | **Cross-references in body text** ("see 2.1, 4.3") | a "2.1" at line start would look like a heading | recorded as references and validated; only bold lines can be headings | `test_cross_references_are_not_headings` |
-| – | Not in this PDF, but guarded: duplicate section numbers, text before the first heading, a section whose ancestors are all missing, bold lines without a number, figures | – | `1.1~2` key + `duplicate_number`, a `front-matter` node, `orphan` at root, `unnumbered_bold_line` kept as body, `figure` block + warning | synthetic PDFs in `test_parser.py` |
+Other cases I guard against even though this PDF does not have them: a repeated section number (gets
+id `1.1~2`), text before the first heading, a section with no parent at all, and bold lines without a
+number. Each one is kept and flagged, never dropped.
 
-The common rule is that **every repair is visible**. The anomalies sit on the node and come back from
-`GET /nodes/{id}`, so a reviewer sees "this was attached to 2.1 because 2.1.1 is missing" instead of a
-tidy tree that hides it.
+My main rule: **if the parser has to guess, it says so.** Every warning is stored on the node and
+returned by the API, so nobody gets a clean-looking tree that is actually wrong.
 
-Content note: 6.2 says "*Anthropic* recommends professional recalibration", in a manual whose
-manufacturer is CardioTrack. That looks like an error in the source document. The parser keeps the text
-exactly as written; correcting source content is not its job. I would raise it with the document owner.
+One more thing I noticed: section 6.2 says "*Anthropic* recommends professional recalibration", but the
+manufacturer is CardioTrack. That looks like a mistake in the document itself. I kept the text as it is,
+because fixing source content is not the parser's job.
 
-### What my first implementation got wrong, and how I found it
+### What went wrong at first and how I found it
 
-Real failures in code I had written:
+1. **Table text came out broken.** PyMuPDF's `Table.extract()` turned "Aborts measurement, displays
+   E1" into "Aborts measurement displays E1" followed by a lone ",". I saw this when I compared the
+   output with `pdftotext -layout`. Fix: I only use PyMuPDF to find the cell boxes, and fill each cell
+   from my own text lines that sit inside it.
+2. **The diff counted digits inside error codes.** For 4.3 ("E1–E5" becoming "E1–E6") it reported
+   "5 removed, 6 added" as if they were numbers. I saw this in the first v1 to v2 report. Fix: digits
+   right after a letter are ignored, and error codes are read as codes.
+3. **Search results showed `child_count: 0`** because I never calculated it there. A wrong 0 is
+   worse than no value, so it now returns `null`.
 
-1. **Table cell text was corrupted.** My first version used `Table.extract()`, which returned
-   `"Aborts measurement displays E1\n,"` for "Aborts measurement, displays E1": the comma moved to a
-   new line. I found it by printing extracted rows next to `pdftotext -layout` output. Fix: use only the
-   table's cell rectangles and fill each cell from my own text lines whose centre falls inside it.
-   Without this, 4.2's hash would depend on a library quirk, and the LLM quotes of table rows would
-   never match the source.
-2. **The numeric diff counted digits inside error codes.** The first diff for 4.3 reported `"5"`
-   removed and `"6"` added (from "E1–E5" → "E1–E6") on top of the real code change. I found it in the
-   first v1→v2 change report. Fix: the quantity pattern now ignores digits that follow a letter, error
-   codes are extracted as codes, and replaced numeric tokens are listed as `{old, new}` pairs
-   (`40 → 30`, `2 → 1.5`).
-3. **Search hits said `child_count: 0`** because counts were not computed there. That is clean-looking
-   but wrong, so they now return `null`.
+I avoided two other problems because I inspected the PDF first: font-size-based levels (they would have
+broken 3.2) and bold detection breaking on the one-character hyphen spans in a different font.
 
-Caught during inspection, before they became bugs:
+How I checked the results: I printed the tree (`scripts/show_tree.py`) and compared it with the PDF by
+eye. I diffed the plain text of v1 and v2 with `pdftotext` to get an independent list of what really
+changed. I ran the OCR check. And I wrote a unit test for every problem above (32 tests in total).
 
-4. **Size-based levels would have failed.** The span dump showed 3.2 and 2.1.1.1 at 11.0pt bold while
-   their siblings are 12.9pt, so I used numbering depth from the start.
-5. **Fallback-font hyphen spans.** The non-breaking hyphen is a separate one-character
-   `NotoSerif-Regular` span inside otherwise uniform lines. A rule like "all spans bold" would demote any
-   bold line containing one. Bold is decided by the spans longer than one character.
+## 4. Matching sections between v1 and v2
 
-How I validated: the span dump and `scripts/show_tree.py` printouts against the PDF; `diff` of
-`pdftotext` v1 vs v2 as an independent list of expected changes (my matcher has to find exactly
-2.1.1.1, 3.2, 4.2, 4.3 modified and 5.3 added, and the test asserts that exact set); the OCR
-cross-check for silent text loss; and unit tests that pin each irregularity.
+I try three steps in order:
 
-## 4. Version matching
+1. **Same section number and a similar heading** (similarity of at least 0.6). Section numbers are
+   the manual's own ids, and they keep the two "Error Codes" sections apart.
+2. **Same heading under a parent with the same heading.** This catches a section that was renumbered.
+3. **Fuzzy match** on heading plus body text, only if one candidate is clearly better than the
+   rest. If it is unclear, the section is treated as new. I would rather miss a match than make a
+   wrong one.
 
-Order of strategies. Each one only sees nodes that are still unmatched:
+Matched and same hash means "unchanged". Matched with a different hash means "modified". No match
+means "added", and old sections that were not matched are listed as "removed".
 
-1. **Same section number, and heading similarity ≥ 0.6.** Numbers are the manual's own identifiers,
-   they survive rewording, and they keep the two "Error Codes" sections apart. The heading check stops a
-   renumbered document from pairing two unrelated sections that happen to share a number.
-2. **Same heading under a parent with the same heading.** Catches renumbering: 3.4 "Auto Shutoff"
-   becoming 3.3. There is a test with swapped sections.
-3. **Fuzzy:** 0.6 × heading similarity + 0.4 × body similarity ≥ 0.75, and the best candidate must beat
-   the runner-up by 0.05. If it is ambiguous, the node is treated as **new**, never guessed.
-
-Unmatched new nodes are `added`. Unmatched old nodes are listed as `removed` in the version's
-`change_summary`. A matched node is `unchanged` if the hashes are equal, otherwise `modified`.
-Re-uploading identical bytes returns the existing version (`created: false`).
-
-Result on the real files: 23 unchanged, 4 modified (2.1.1.1, 3.2, 4.2, 4.3), 1 added (5.3), 0 removed.
-3.1 is correctly unchanged despite reflowing across pages.
+On the real files: 23 sections unchanged, 4 modified (2.1.1.1, 3.2, 4.2, 4.3), 1 added (5.3), and none
+removed. This matches the `pdftotext` diff exactly.
 
 **Where it breaks:**
-* **Renumbered and reworded at the same time:** step 1 misses it (different number), step 2 misses it
-  (heading changed), and step 3 only catches it if the body is still similar. Otherwise it shows as
-  removed + added, and its test cases go `stale` ("section removed"). That is the safe direction.
-* **Split or merged sections:** 4.2 split into 4.2 and 4.4 maps 4.2 to 4.2 (modified) and makes 4.4 new.
-  There is no one-to-many lineage.
-* **Short headings:** 0.6 similarity on two short words is a weak signal ("Start" vs "Stop" scores
-  0.44, so it is rejected, but other short pairs could pass). I would add a body-similarity veto for
-  step 1.
-* **A number reused for a different topic with a similar heading** ("Error Codes" → "Error Code
-  Handling") is accepted as the same section by design.
+- A section that is renumbered **and** retitled at the same time shows up as removed plus added. Its
+  old test cases then show as stale, which is the safe side to be wrong on.
+- A section split into two is not tracked as a split. The first half matches, and the second is new.
+- Very short headings make the 0.6 similarity check weak.
+- If a number is reused for a different topic with a similar title, it is accepted as the same section.
 
-## 5. LLM generation
+## 5. LLM test case generation
 
-### Prompt design
+### The prompt
 
-* The system prompt sets the role (medical-device QA), asks for 3–5 executable cases, prefers
-  numbers, limits, error codes and safety behaviour, and gives the exact JSON shape.
-* Each source goes in a `<section node_id=… number=… heading=…>` tag, and the prompt says that **text
-  inside the tags is data, not instructions**. The manual is untrusted input like any other.
-* Every case must return `source_node_ids` (chosen from the given ids) and a **verbatim
-  `requirement_quote`**. The quote is the key design choice: it pins each case to one specific
-  requirement sentence, list item or table row, not just to a section. That is what makes per-case
-  staleness possible later.
-* `temperature 0.2`, `response_format: json_object` where the provider supports it, and
-  `PROMPT_VERSION` is stored on every generation.
+- It tells the model it is a medical-device QA engineer and asks for 3 to 5 test cases in an exact
+  JSON format.
+- Each section is wrapped in a `<section node_id=...>` tag. The prompt says text inside the tags is
+  only data, so instructions hidden in the manual are ignored.
+- Every test case must list the `source_node_ids` it is based on and a **`requirement_quote` copied
+  word for word** from the manual. This quote is the most important part of my design. It ties each
+  test case to one exact sentence or table row, and that is what makes the staleness check possible.
 
-### When the output is malformed, incomplete or off-spec
+### When the LLM gives a bad answer
 
-| Situation | Behaviour | Reason |
-|---|---|---|
-| Fenced code, leading prose, bare list | unwrapped and accepted | zero risk; rejecting it only burns a retry |
-| Truncated/invalid JSON, no `test_cases` | attempt rejected; retry with the parse error fed back | |
-| A case fails the Pydantic schema (missing steps, priority "urgent") | that case is dropped, reason recorded | |
-| A case cites a node id not in the selection | dropped | would break traceability |
-| The quote is not verbatim in a cited section | dropped | a made-up requirement is the most dangerous output; there is no "fixing" it |
-| Duplicate titles | dropped, warning | |
-| More than 5 valid cases | first 5 kept, warning | the spec says 3–5 |
-| Fewer than 3 valid after dropping | retry with all errors listed | |
-| Timeout / 429 / 5xx | counts as an attempt, small backoff, retry | |
-| `LLM_MAX_ATTEMPTS` (3) exhausted | generation stored with `status: failed`, raw outputs and errors kept, HTTP **502** | the failure is visible and debuggable, and never served as test cases |
+- **Fenced code or extra text around the JSON**: I strip it and continue.
+- **Broken JSON**: I reject the attempt and retry, sending the error back to the model.
+- **One test case fails the schema** (missing steps, wrong priority value): I drop that case and
+  record why.
+- **A case cites a section that was not in the selection**: I drop it.
+- **A case's quote is not really in the manual**: I drop it. A made-up requirement is the most
+  dangerous mistake an LLM can make here.
+- **More than 5 valid cases**: I keep the first 5.
+- **Fewer than 3 valid cases**: I retry.
+- **Timeout or server error**: I wait a little and retry.
+- **3 failed attempts**: I save the generation as `failed` with all the raw answers and return HTTP 502.
 
-So the envelope is lenient and the content is strict. Partial success (3 good cases out of 5) is
-accepted, because the cases that were dropped are recorded as warnings.
+In short: I am relaxed about the wrapping and strict about the content. Nothing that failed the checks
+is ever saved as a good result.
 
 ### Same selection submitted twice
 
-**Policy: return the existing successful generation (HTTP 200, `reused: true`).** The cache key is
-(selection id, prompt version, provider, model). A selection is version-pinned, so its input text can
-never change. A second call would just be a second, different random answer to the same question,
-which costs money and leaves two conflicting sets of test cases traced to the same text. `force: true`
-deliberately regenerates: a new generation that records `supersedes`, and the old one is kept for
-audit. Failed generations are not cached, so resubmitting after a failure tries again. A per-key lock
-stops two concurrent identical submits from making two LLM calls. Changing the prompt version or model
-naturally gives a new key.
+I return the **existing** result instead of calling the LLM again. A selection is pinned to fixed text,
+so asking again would only produce a second, different answer to the same question. That costs money,
+and it leaves two conflicting sets of test cases for the same requirement. If someone really wants a new
+one, `force: true` makes a new generation, marks which one it replaces, and keeps the old one. Failed
+generations are not reused, so submitting again after a failure tries again.
 
-## 6. Staleness / impact detection
+## 6. Detecting stale test cases
 
-Computed **on every read** (`GET /generations/...`, `GET /selections/{id}/generations`), against the
-latest version, using the source snapshot inside the generation.
+Every time you fetch a generation, it is compared with the latest version of the manual.
 
-Per source section (found by logical identity): `unchanged`, `changed` (with diff + severity), or
-`removed`.
+For each source section: is it unchanged, changed, or removed? If it changed, is the change
+**substantive** (a number, unit, error code, or a word like "not", "must" or "except" changed) or
+only **wording**?
 
-Severity (`app/diffing.py`):
-* `substantive`: a number/quantity, an error code, or a modal/negation word (`not`, `must`, `cannot`,
-  `except`, `only`, ...) was added, removed or replaced.
-* `wording`: anything else.
+For each test case, using its quote:
 
-Per test case, using its verbatim quote:
+- **current**: none of its sections changed.
+- **review_minor**: a section was only reworded, and the quote is still there.
+- **review**: a section changed in a way that matters, but the exact quoted requirement is still
+  there. Example: a test on error E1 after E3 changed and E6 was added.
+- **stale**: the quote is no longer in the text, or the section was removed. Example: "inflates in
+  40 mmHg increments" became 30 mmHg.
 
-| Verdict | Rule | Example from v1 → v2 |
-|---|---|---|
-| `current` | all cited sections unchanged | 6.1 cleaning |
-| `review_minor` | cited section reworded, the quote is still there | – |
-| `review` | cited section changed substantively, but the quoted requirement is still there verbatim | a test on the E1 row after E3 changed and E6 was added |
-| `stale` | the quote is gone from every cited section, or a section was removed | "inflates in 40 mmHg increments" → 30 mmHg; "E3 … within 2 seconds" → 1.5 s |
+It also lists sections that were added after the test cases were made (5.3 Data Export). That is
+not staleness, it is a gap in coverage.
 
-The generation's overall status is its worst case. `new_sections_since` lists sections added after
-generation (5.3 Data Export). That is a **coverage gap**, not staleness: no old test case is wrong
-because of it, but the selection may now be incomplete.
-
-**To the question "is a one-word wording change treated the same as a changed pressure threshold?"**:
-No. A threshold change is `substantive`, and if it touches the quoted requirement the case is `stale`.
-A wording change elsewhere in the section is `review_minor`. But a wording change inside the quote
-makes the case `stale` too, even if the meaning did not change, because the check is literal. I chose
-that deliberately: for a medical device, a false "stale" costs a reviewer a minute, while a false
-"current" ships a wrong test. The opposite gap also exists: a one-word change like "inflate" →
-"deflate" outside a quote is only `review_minor`, because the severity rules don't understand
-meaning. That is why nothing below `current` is presented as safe.
+**Is a one-word wording change treated like a changed pressure threshold?** No. A threshold change
+is "substantive" and makes the case stale. A wording change elsewhere in the section is only
+"review_minor". There are limits, though. If the rewording is *inside* the quote, the case shows as
+stale even when the meaning is the same, because I compare the text literally. I accept that, because
+for a medical device a false alarm is cheap and a missed change is not. And a change like
+"inflate" to "deflate" outside the quote only counts as wording, because my rules do not understand
+meaning.
 
 ## 7. Decision log
 
-**1. Which part is most likely to give wrong results silently, and how would I catch it?**
-The **version matcher**. If it pairs the wrong old and new sections (say, after a renumbering where a
-different section inherits the old number with a similar title), every downstream signal is wrong
-without any error: a stale test case reads as `current` because the hash it compares against belongs to
-another section. I catch the cases I know about with the heading check and the ambiguity margin. In
-production I would add: (a) an alert when a matched pair has body similarity below ~0.5 (that is
-probably a different section); (b) storing `match_method` (already done) and requiring human
-confirmation for `fuzzy` matches; and (c) a golden v1/v2 pair in CI that asserts the exact
-modified/added/removed sets. The `pdftotext` diff gave me that independent check here.
+**1. What part could silently give wrong results without any error? How would I catch it?**
+The version matcher. If it pairs the wrong old and new sections, everything after it is wrong: a stale
+test case can look "current" because it is being compared with the wrong section, and nothing crashes.
+To catch it, I would raise an alert when a matched pair has very different body text, ask a person to
+confirm every fuzzy match, and keep the real v1/v2 files as a fixed test that checks the exact list of
+changed sections. That last check already exists in my tests.
 
 **2. Where did I choose simplicity over correctness, and what breaks first in production?**
-(a) **TinyDB** rewrites the whole JSON file on every insert and is single-process. With two uvicorn
-workers, generations will be lost or the file corrupted. That breaks first. (b) Staleness uses
-**literal quote matching and regex severity** instead of semantic comparison, so equivalent rewording is
-over-reported as stale. (c) The parser is tuned to this document's conventions (bold + number =
-heading). A manual using unnumbered headings, or a scanned one where OCR gives no bold information,
-would produce a flat tree, though it would say so through `ocr_page` / `unnumbered_bold_line`
-warnings. (d) Ingestion runs synchronously inside the request.
+TinyDB breaks first. With more than one server process, generations would get lost or the file would
+get corrupted. I also check staleness with exact quote matching instead of real meaning, so reworded
+but equivalent text gets flagged. The parser depends on this manual's style (bold plus a number means
+a heading), so a manual without numbered headings would come out flat, though with warnings. Ingestion
+also runs inside the request instead of in a background job.
 
-**3. One input I did not handle, and what the system does with it.**
-**A heading that wraps onto two lines where the second line is also bold.** I wrote a merge for it (a
-bold line directly after a heading with no body yet), but nothing in these PDFs or the tests
-exercises it. Worse, it would wrongly merge a sub-heading that has no number and directly follows
-a heading. The other clear gap: **a table that continues across a page break** is extracted as two
-separate tables in the same section. The rows are all kept and attributed to the right section, but the
-second part has no header row, and adding a row on the second page changes that section's hash like any
-other edit. On the LLM side, a response that is valid but in another language, or that quotes the
-requirement correctly but tests something unrelated, passes validation. I only check that the quote
-exists, not that the steps actually test it.
+**3. One input I did not handle, and what happens.**
+A table that continues onto the next page. It is read as two separate tables in the same section. No
+rows are lost, but the second part has no header row. Another one: a heading that wraps onto two bold
+lines. I wrote code to join them, but no test covers it, and it could wrongly join an unnumbered bold
+line that comes right after a heading. On the LLM side, a test case can quote the right sentence but
+test something unrelated. My checks only confirm that the quote exists, not that the steps really test it.
 
-## 8. With more time
+## 8. What I would do with more time
 
-* Semantic staleness: compare an embedding or a small LLM judgement of "does this requirement still
-  mean the same?" for `review` cases, keeping the literal check as the first gate.
-* Requirement-level nodes: split sections into atomic requirements (sentence / list item / table row)
-  with their own hashes, so traceability and staleness work at the level the test cases actually use.
-* Mongo (or Postgres JSONB) store, background ingestion jobs, Alembic migrations.
-* Match review endpoint: show fuzzy matches and let a human confirm or reject them.
-* Run against a real provider in CI with recorded responses (VCR-style) to catch prompt regressions.
+- Use embeddings or a small LLM check to decide whether a changed requirement still means the same thing.
+- Split sections into single requirements (one per sentence, list item or table row), each with its own hash.
+- Move to MongoDB or Postgres, run ingestion as a background job, and add database migrations.
+- Add an endpoint where a person can approve or reject fuzzy matches.
+- Record real LLM responses and replay them in tests, to catch it when a prompt change makes the output worse.
