@@ -27,7 +27,7 @@ from sqlalchemy.orm import Session
 
 from app.diffing import diff_summary, similarity
 from app.models import Document, DocumentVersion, LogicalNode, Node
-from app.parser import ParsedDocument, Section, collapse_ws, parse_pdf
+from app.parser import ParsedDocument, collapse_ws, ocr_crosscheck, parse_pdf
 
 HEADING_MIN_SIM = 0.6
 FUZZY_MIN = 0.75
@@ -49,7 +49,7 @@ def file_sha256(path: str | Path) -> str:
 
 
 def ingest_pdf(db: Session, path: str | Path, slug: str = "ct200",
-               source_name: str | None = None) -> IngestResult:
+               source_name: str | None = None, ocr_check: bool = False) -> IngestResult:
     path = Path(path)
     sha = file_sha256(path)
     doc = db.scalar(select(Document).where(Document.slug == slug))
@@ -64,6 +64,14 @@ def ingest_pdf(db: Session, path: str | Path, slug: str = "ct200",
         return IngestResult(latest, created=False)
 
     parsed = parse_pdf(path)
+    if ocr_check:
+        # Words OCR sees on the rendered page but the text layer does not have
+        # (text in images, dropped spans). Reported, never merged in automatically.
+        for page in ocr_crosscheck(path):
+            if page["coverage"] < 0.98:
+                parsed.warnings.append({"type": "ocr_mismatch", "page": page["page"],
+                                        "detail": f"text layer covers {page['coverage']:.0%} of OCR words",
+                                        "ocr_only_words": page["ocr_only_words"]})
     return IngestResult(store_parsed(db, doc, parsed, source_name or path.name, sha, latest), created=True)
 
 

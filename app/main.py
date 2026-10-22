@@ -77,7 +77,8 @@ def _register(app: FastAPI) -> None:
                path: str | None = Query(default=None, description="server-side path, e.g. data/ct200_manual_v2.pdf"),
                db: Session = Depends(get_db)):
         with _local_pdf(file, path) as (local, name):
-            res = ingest_pdf(db, local, slug=slug, source_name=name)
+            res = ingest_pdf(db, local, slug=slug, source_name=name,
+                             ocr_check=app.state.settings.ocr_crosscheck)
         return {"created": res.created, "version": _version_out(res.version)}
 
     @app.get("/documents")
